@@ -7,8 +7,10 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import openpyxl
 
 app = FastAPI()
@@ -23,13 +25,11 @@ app.add_middleware(
 
 def parse_exam_structure(doc):
     """
-    Phân tách đề thi thành 2 phần:
-    - Phần I: Trắc nghiệm 4 lựa chọn (A, B, C, D)
-    - Phần II: Trắc nghiệm Đúng/Sai (a, b, c, d)
+    Bóc tách đề thi chuẩn xác thành Phần I và Phần II, loại bỏ rác, 
+    nhận diện chính xác đáp án đúng có dấu * (*A., *a.,...).
     """
     full_text_blocks = []
 
-    # Thu thập văn bản từ paragraphs và bảng biểu (2 cột)
     for p in doc.paragraphs:
         t = p.text.strip()
         if t:
@@ -43,11 +43,10 @@ def parse_exam_structure(doc):
                     if t:
                         full_text_blocks.append(t)
 
-    # Loại bỏ các thông tin rác / tiêu đề / hướng dẫn phòng thi
     ignore_keywords = [
         "bộ giáo dục", "kỳ thi", "môn thi", "thí sinh không được", 
         "giám thị", "đề thi chính thức", "đề thi có", "thời gian làm bài", 
-        "hết", "trang"
+        "hết", "trang", "họ, tên thí sinh", "số báo danh"
     ]
 
     filtered_blocks = []
@@ -64,24 +63,22 @@ def parse_exam_structure(doc):
 
     full_text = "\n".join(filtered_blocks)
 
-    # Nhận diện vị trí bắt đầu Phần I và Phần II
     part1_text = full_text
     part2_text = ""
 
-    # Tìm ranh giới Phần II (thường chứa "PHẦN II", "Phần II" hoặc "PHẦN 2")
     part2_match = re.search(r'(PHẦN\s+(?:II|2)[^\n]*)', full_text, re.IGNORECASE)
     if part2_match:
         split_pos = part2_match.start()
         part1_text = full_text[:split_pos]
         part2_text = full_text[split_pos:]
 
-    # --- 1. BÓC TÁCH PHẦN I (TRẮC NGHIỆM 4 LỰA CHỌN) ---
+    # --- PHẦN I ---
     part1_questions = []
     p1_parts = re.split(r'(Câu\s+\d+[\.:])', part1_text)
 
     for i in range(1, len(p1_parts), 2):
         q_content = p1_parts[i+1]
-        option_matches = list(re.finditer(r'(\*?\s*[A-D][\.\)])', q_content))
+        option_matches = list(re.finditer(r'(?:^|\n)\s*(\*?\s*[A-D][\.\)])', q_content))
 
         if len(option_matches) >= 4:
             first_opt_pos = option_matches[0].start()
@@ -113,15 +110,14 @@ def parse_exam_structure(doc):
                     "options": options[:4]
                 })
 
-    # --- 2. BÓC TÁCH PHẦN II (ĐÚNG / SAI) ---
+    # --- PHẦN II ---
     part2_questions = []
     if part2_text:
         p2_parts = re.split(r'(Câu\s+\d+[\.:])', part2_text)
 
         for i in range(1, len(p2_parts), 2):
             q_content = p2_parts[i+1]
-            # Tìm các ý nhỏ dạng *a), a), *b), b)...
-            sub_option_matches = list(re.finditer(r'(\*?\s*[a-d][\.\)])', q_content))
+            sub_option_matches = list(re.finditer(r'(?:^|\n)\s*(\*?\s*[a-d][\.\)])', q_content))
 
             if len(sub_option_matches) >= 4:
                 first_opt_pos = sub_option_matches[0].start()
@@ -136,7 +132,6 @@ def parse_exam_structure(doc):
                     end_pos = sub_option_matches[j+1].start() if j + 1 < len(sub_option_matches) else len(q_content)
                     opt_raw = q_content[start_pos:end_pos].strip()
 
-                    # Có dấu * ở đầu là ĐÚNG, không có dấu * là SAI
                     is_true = opt_raw.startswith("*")
                     clean_opt = opt_raw.lstrip("* ").strip()
                     
@@ -155,6 +150,47 @@ def parse_exam_structure(doc):
                     })
 
     return part1_questions, part2_questions
+
+def add_header_block(doc, exam_code):
+    """Tạo khối header chuẩn form Bộ GD&ĐT"""
+    p_top = doc.add_paragraph()
+    r_top1 = p_top.add_run("BỘ GIÁO DỤC VÀ ĐÀO TẠO\nĐỀ THI CHÍNH THỨC")
+    r_top1.bold = True
+    r_top1.font.name = 'Times New Roman'
+    r_top1.font.size = Pt(11)
+    
+    # Canh lề tiêu đề sang phải/trái đối xứng (hoặc dùng bảng ẩn 1 dòng 2 cột cho chuẩn)
+    table_hdr = doc.add_table(rows=1, cols=2)
+    table_hdr.autofit = False
+    table_hdr.columns[0].width = Inches(3.2)
+    table_hdr.columns[1].width = Inches(3.3)
+    
+    cell_l = table_hdr.cell(0, 0)
+    cell_r = table_hdr.cell(0, 1)
+    
+    p_l = cell_l.paragraphs[0]
+    p_l.add_run("BỘ GIÁO DỤC VÀ ĐÀO TẠO\nĐỀ THI CHÍNH THỨC\n(Đề thi có trang)").bold = True
+    for run in p_l.runs:
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(10)
+        
+    p_r = cell_r.paragraphs[0]
+    p_r.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p_r.add_run("KỲ THI TỐT NGHIỆP TRUNG HỌC PHỔ THÔNG\nMôn thi: LỊCH SỬ\nThời gian làm bài: 50 phút").bold = True
+    for run in p_r.runs:
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(10)
+
+    doc.add_paragraph()
+    
+    # Khối thông tin thí sinh & Mã đề
+    p_info = doc.add_paragraph()
+    r_info = p_info.add_run(f"Họ, tên thí sinh: ...........................................................................\nSố báo danh: .............................................................  Mã đề: {exam_code}")
+    r_info.bold = True
+    r_info.font.name = 'Times New Roman'
+    r_info.font.size = Pt(11)
+    
+    doc.add_paragraph()
 
 @app.post("/api/mix-exams")
 async def mix_exams(
@@ -185,37 +221,30 @@ async def mix_exams(
             exam_code = start_code + c
             new_doc = Document()
 
-            # Giữ lại Header nếu có
-            if len(doc.sections) > 0:
-                src_sec = doc.sections[0]
-                new_sec = new_doc.sections[0]
-                for p in src_sec.header.paragraphs:
-                    if p.text.strip():
-                        new_sec.header.add_paragraph(p.text)
+            # Thiết lập lề chuẩn Word (2cm - 2.5cm)
+            for section in new_doc.sections:
+                section.top_margin = Inches(1)
+                section.bottom_margin = Inches(1)
+                section.left_margin = Inches(1)
+                section.right_margin = Inches(1)
 
-            # In tiêu đề mã đề
-            p_title = new_doc.add_paragraph()
-            r_title = p_title.add_run(f"MÃ ĐỀ THI: {exam_code}")
-            r_title.bold = True
-            r_title.font.name = 'Times New Roman'
-            r_title.font.size = Pt(13)
-            p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            new_doc.add_paragraph()
+            # Chèn Header chuẩn đề thi
+            add_header_block(new_doc, exam_code)
 
-            # ================= GHI PHẦN I =================
+            # ================= PHẦN I =================
             if len(p1_questions) > 0:
-                p_p1_head = new_doc.add_paragraph()
-                r_p1_head = p_p1_head.add_run("PHẦN I. Câu hỏi trắc nghiệm nhiều phương án lựa chọn")
-                r_p1_head.bold = True
-                r_p1_head.font.name = 'Times New Roman'
-                r_p1_head.font.size = Pt(12)
+                p_p1 = new_doc.add_paragraph()
+                r_p1 = p_p1.add_run("PHẦN I. Thí sinh trả lời từ câu 1 đến câu 24. Mỗi câu hỏi thí sinh chỉ chọn một phương án.")
+                r_p1.bold = True
+                r_p1.font.name = 'Times New Roman'
+                r_p1.font.size = Pt(11)
 
                 shuffled_p1 = p1_questions.copy()
                 random.shuffle(shuffled_p1)
 
                 for idx, q in enumerate(shuffled_p1):
                     p_q = new_doc.add_paragraph()
-                    r_q = p_q.add_run(f"Câu {idx + 1}: {q['question_text']}")
+                    r_q = p_q.add_run(f"Câu {idx + 1}. {q['question_text']}")
                     r_q.bold = True
                     r_q.font.name = 'Times New Roman'
                     r_q.font.size = Pt(11)
@@ -226,16 +255,46 @@ async def mix_exams(
                     labels = ["A", "B", "C", "D"]
                     correct_label = "A"
 
-                    for opt_i, opt in enumerate(options):
-                        if opt_i < len(labels):
-                            lbl = labels[opt_i]
-                            p_opt = new_doc.add_paragraph()
-                            r_opt = p_opt.add_run(f"{lbl}. {opt['text']}")
-                            r_opt.font.name = 'Times New Roman'
-                            r_opt.font.size = Pt(11)
-                            
-                            if opt["correct"]:
-                                correct_label = lbl
+                    # Kiểm tra nếu các đáp án ngắn thì trình bày 2 cột ngang cho đẹp
+                    max_opt_len = max([len(opt['text']) for opt in options])
+                    is_short_options = max_opt_len < 45
+
+                    if is_short_options:
+                        # Trình bày dạng 2 cột (Dùng bảng ẩn 2x2 không viền)
+                        tbl_opt = new_doc.add_table(rows=2, cols=2)
+                        tbl_opt.autofit = False
+                        tbl_opt.columns[0].width = Inches(3.25)
+                        tbl_opt.columns[1].width = Inches(3.25)
+
+                        cell_coords = [(0, 0), (0, 1), (1, 0), (1, 1)]
+                        for opt_i, opt in enumerate(options):
+                            if opt_i < 4:
+                                lbl = labels[opt_i]
+                                r, c = cell_coords[opt_i]
+                                cell = tbl_opt.cell(r, c)
+                                p_cell = cell.paragraphs[0]
+                                r_cell = p_cell.add_run(f"{lbl}. {opt['text']}")
+                                r_cell.font.name = 'Times New Roman'
+                                r_cell.font.size = Pt(11)
+
+                                if opt["correct"]:
+                                    correct_label = lbl
+                        new_doc.add_paragraph()
+                    else:
+                        # Trình bày dạng 1 cột dọc thông thường
+                        for opt_i, opt in enumerate(options):
+                            if opt_i < len(labels):
+                                lbl = labels[opt_i]
+                                p_opt = new_doc.add_paragraph()
+                                # Thụt lề nhẹ cho đáp án
+                                p_opt.paragraph_format.left_indent = Inches(0.25)
+                                r_opt = p_opt.add_run(f"{lbl}. {opt['text']}")
+                                r_opt.font.name = 'Times New Roman'
+                                r_opt.font.size = Pt(11)
+                                
+                                if opt["correct"]:
+                                    correct_label = lbl
+                        new_doc.add_paragraph()
 
                     excel_answer_data.append({
                         "Mã đề": exam_code,
@@ -243,28 +302,27 @@ async def mix_exams(
                         "Câu hỏi": f"Câu {idx + 1}",
                         "Đáp án đúng": correct_label
                     })
-                    new_doc.add_paragraph()
 
-            # ================= GHI PHẦN II =================
+            # ================= PHẦN II =================
             if len(p2_questions) > 0:
-                p_p2_head = new_doc.add_paragraph()
-                r_p2_head = p_p2_head.add_run("PHẦN II. Câu hỏi trắc nghiệm Đúng/Sai")
-                r_p2_head.bold = True
-                r_p2_head.font.name = 'Times New Roman'
-                r_p2_head.font.size = Pt(12)
+                p_p2 = new_doc.add_paragraph()
+                r_p2 = p_p2.add_run("PHẦN II. Thí sinh trả lời từ câu 1 đến câu 4. Trong mỗi ý a), b), c), d) ở mỗi câu, thí sinh chọn đúng hoặc sai.")
+                r_p2.bold = True
+                r_p2.font.name = 'Times New Roman'
+                r_p2.font.size = Pt(11)
 
                 shuffled_p2 = p2_questions.copy()
                 random.shuffle(shuffled_p2)
 
                 for idx, q in enumerate(shuffled_p2):
                     p_q = new_doc.add_paragraph()
-                    r_q = p_q.add_run(f"Câu {idx + 1}: {q['question_text']}")
+                    r_q = p_q.add_run(f"Câu {idx + 1}. {q['question_text']}")
                     r_q.bold = True
                     r_q.font.name = 'Times New Roman'
                     r_q.font.size = Pt(11)
 
                     sub_opts = q["sub_options"].copy()
-                    random.shuffle(sub_opts) # Xáo trộn thứ tự các ý a, b, c, d
+                    random.shuffle(sub_opts)
 
                     sub_labels = ["a", "b", "c", "d"]
 
@@ -272,6 +330,7 @@ async def mix_exams(
                         if s_i < len(sub_labels):
                             lbl = sub_labels[s_i]
                             p_sub = new_doc.add_paragraph()
+                            p_sub.paragraph_format.left_indent = Inches(0.25)
                             r_sub = p_sub.add_run(f"{lbl}) {s_opt['text']}")
                             r_sub.font.name = 'Times New Roman'
                             r_sub.font.size = Pt(11)
@@ -290,7 +349,6 @@ async def mix_exams(
             new_doc.save(exam_file_path)
             generated_files.append(exam_file_path)
 
-        # Tạo file Excel tổng hợp đáp án
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Bang_Dap_An"
@@ -303,7 +361,6 @@ async def mix_exams(
         wb.save(excel_path)
         generated_files.append(excel_path)
 
-        # Nén file ZIP
         zip_filename = "Bo_De_Thi_Tron.zip"
         zip_path = os.path.join(output_dir, zip_filename)
         with zipfile.ZipFile(zip_path, 'w') as zipf:
