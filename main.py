@@ -10,6 +10,10 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import openpyxl
+from fastapi import UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+from PIL import Image
+import io
 
 app = FastAPI()
 
@@ -375,3 +379,33 @@ async def mix_exams(
         if os.path.exists(temp_input_path):
             os.remove(temp_input_path)
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- TÍNH NĂNG CHUYỂN ĐỔI VÀ XỬ LÝ ẢNH ---
+@app.post("/api/convert-image")
+async def convert_image(
+    file: UploadFile = File(...),
+    target_format: str = Form(...)  # nhận giá trị: "JPEG", "PNG", "WEBP"
+):
+    try:
+        # Đọc file ảnh từ request upload của người dùng
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data))
+
+        # Nếu ảnh có kênh màu RGBA (như PNG trong suốt) mà muốn đổi sang JPEG thì phải chuyển về RGB
+        if target_format.upper() == "JPEG" and image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+
+        # Tạo tên file output
+        original_name = os.path.splitext(file.filename)[0]
+        output_filename = f"{original_name}_converted.{target_format.lower()}"
+        output_path = os.path.join("output_exams", output_filename)
+        
+        os.makedirs("output_exams", exist_ok=True)
+        
+        # Lưu ảnh với định dạng mới
+        image.save(output_path, format=target_format.upper())
+
+        return FileResponse(output_path, media_type=f"image/{target_format.lower()}", filename=output_filename)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi chuyển đổi ảnh: {str(e)}")
