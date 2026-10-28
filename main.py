@@ -22,14 +22,20 @@ app.add_middleware(
 )
 
 def extract_questions_clean(doc):
+    """
+    Bóc tách câu hỏi, loại bỏ hoàn toàn các dòng tiêu đề, hướng dẫn, chữ HẾT rác
+    và hỗ trợ trọn vẹn định dạng đáp án có dấu * ở đầu.
+    """
     questions = []
     full_text_blocks = []
 
+    # Thu thập toàn bộ text từ paragraph
     for p in doc.paragraphs:
         t = p.text.strip()
         if t:
             full_text_blocks.append(t)
 
+    # Thu thập toàn bộ text từ các bảng (đề thi chia cột)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -38,13 +44,34 @@ def extract_questions_clean(doc):
                     if t:
                         full_text_blocks.append(t)
 
-    full_text = "\n".join(full_text_blocks)
-    parts = re.split(r'(Câu\s+\d+[\.:])', full_text)
+    # Danh sách từ khóa rác (tiêu đề, hướng dẫn, footer, chữ HẾT) cần lọc bỏ
+    ignore_keywords = [
+        "bộ giáo dục", "kỳ thi", "môn thi", "thí sinh không được", 
+        "giám thị", "đề thi chính thức", "đề thi có", "thời gian làm bài", 
+        "hết", "trang"
+    ]
 
-    print(f"DEBUG: Tổng số phần cắt được từ văn bản: {len(parts)}")
+    filtered_blocks = []
+    for t in full_text_blocks:
+        t_lower = t.lower()
+        is_meta = False
+        # Nếu là dòng ngắn chứa từ khóa rác và không phải là câu hỏi bắt đầu bằng "Câu"
+        if any(kw in t_lower for kw in ignore_keywords) and len(t) < 130 and not t_lower.startswith("câu"):
+            is_meta = True
+        if "-------" in t or "===" in t or "___" in t:
+            is_meta = True
+        
+        if not is_meta:
+            filtered_blocks.append(t)
+
+    # Nối lại thành chuỗi sạch để quét Regex
+    full_text = "\n".join(filtered_blocks)
+    parts = re.split(r'(Câu\s+\d+[\.:])', full_text)
 
     for i in range(1, len(parts), 2):
         q_content = parts[i+1]
+        
+        # Tìm vị trí các đáp án A, B, C, D (có thể có * ở đầu)
         option_matches = list(re.finditer(r'(\*?\s*[A-D][\.\)])', q_content))
 
         if len(option_matches) >= 4:
@@ -77,7 +104,6 @@ def extract_questions_clean(doc):
                     "options": options[:4]
                 })
 
-    print(f"DEBUG: ĐÃ BÓC TÁCH THÀNH CÔNG {len(questions)} CÂU HỎI!")
     return questions
 
 @app.post("/api/mix-exams")
@@ -86,7 +112,6 @@ async def mix_exams(
     code_count: int = Form(4),
     start_code: int = Form(101)
 ):
-    print(">>> ĐÃ NHẬN ĐƯỢC REQUEST TRỘN ĐỀ TỪ WEB! <<<")
     temp_input_path = f"temp_{file.filename}"
     try:
         with open(temp_input_path, "wb") as buffer:
@@ -96,7 +121,7 @@ async def mix_exams(
         questions_data = extract_questions_clean(doc)
 
         if len(questions_data) == 0:
-            raise ValueError("Không tìm thấy cấu trúc câu hỏi!")
+            raise ValueError("Không tìm thấy cấu trúc câu hỏi hợp lệ trong file!")
 
         output_dir = "output_exams"
         if os.path.exists(output_dir):
@@ -110,6 +135,7 @@ async def mix_exams(
             exam_code = start_code + c
             new_doc = Document()
 
+            # Giữ lại Header gốc nếu có
             if len(doc.sections) > 0:
                 src_sec = doc.sections[0]
                 new_sec = new_doc.sections[0]
@@ -117,6 +143,7 @@ async def mix_exams(
                     if p.text.strip():
                         new_sec.header.add_paragraph(p.text)
 
+            # In tiêu đề mã đề
             p_title = new_doc.add_paragraph()
             r_title = p_title.add_run(f"MÃ ĐỀ THI: {exam_code}")
             r_title.bold = True
@@ -125,7 +152,7 @@ async def mix_exams(
             p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
             new_doc.add_paragraph()
 
-            # Xáo trộn câu hỏi
+            # Xáo trộn thứ tự câu hỏi
             shuffled_questions = questions_data.copy()
             random.shuffle(shuffled_questions)
 
@@ -136,7 +163,7 @@ async def mix_exams(
                 r_q.font.name = 'Times New Roman'
                 r_q.font.size = Pt(11)
 
-                # Xáo trộn đáp án
+                # Xáo trộn thứ tự các đáp án A, B, C, D
                 options = q["options"].copy()
                 random.shuffle(options)
 
@@ -168,7 +195,7 @@ async def mix_exams(
 
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "Bang_D_p_An"
+        ws.title = "Bang_Dap_An"
         ws.append(["Mã đề", "Câu hỏi", "Đáp án đúng"])
         
         for row in excel_answer_data:
@@ -188,11 +215,9 @@ async def mix_exams(
         if os.path.exists(temp_input_path):
             os.remove(temp_input_path)
 
-        print(">>> TẠO FILE VÀ NÉN ZIP THÀNH CÔNG! <<<")
         return FileResponse(zip_path, media_type="application/zip", filename="Bo_De_Thi_Tron.zip")
 
     except Exception as e:
-        print(f"!!! LỖI XẢY RA: {str(e)} !!!")
         if os.path.exists(temp_input_path):
             os.remove(temp_input_path)
         raise HTTPException(status_code=500, detail=str(e))
